@@ -1,0 +1,558 @@
+from FaceNetPack.Model.Backbone import CowResNet
+from FaceNetPack.Model.ArcFace import ArcFaceLoss, LocalSplitArcFaceLoss, SupConLoss, build_optim
+from FaceNetPack.Model.VisionTransformer import ViT
+from FaceNetPack.data_processor.img2img import Process, dataset as FaceDataset, SingleImageDataset
+import torch
+import torch.nn as nn
+import torch.distributed as dist
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
+import os
+from pathlib import Path
+from tqdm import tqdm
+from torch.amp import autocast, GradScaler
+from torch.utils.tensorboard import SummaryWriter
+from FaceNetPack.Model.MarginModel import Margin_cal
+
+all_state = Path(__file__).resolve().parent / "State" / "cloud_model.pth"
+log_path = Path(__file__).resolve().parents[1] / "tf-logs" / "cloud_model" #modified
+writer = None
+LABEL_SMOOTHING = 0.0
+VAL_EXTREME_TOPK = (1, 10, 100)
+VAL_EXTREME_SAMPLE_SIZE = 500
+VAL_EXTREME_SAMPLE_SEED = 0
+
+def setup_ddp():
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    if torch.cuda.is_available(): torch.cuda.set_device(local_rank)
+    return local_rank
+
+def is_main_process():
+    return (not dist.is_initialized()) or dist.get_rank() == 0
+
+device = torch.device(f"cuda:{os.environ.get('LOCAL_RANK', 0)}" if torch.cuda.is_available() else "cpu")
+world_size = 1
+
+
+def build_pair_eval_loader(source_ld, template_ld):
+    eval_ds = FaceDataset(
+        source_ld.dataset.persons,
+        train=False,
+        train_num=len(template_ld.dataset),
+        img_size=source_ld.dataset.out_size,
+    )
+    if isinstance(template_ld.sampler, DistributedSampler):
+        eval_sampler = DistributedSampler(
+            eval_ds,
+            num_replicas=template_ld.sampler.num_replicas,
+            rank=template_ld.sampler.rank,
+            shuffle=False,
+        )
+    else:
+        eval_sampler = None
+
+    loader_args = {
+        "batch_size": template_ld.batch_size,
+        "drop_last": True,
+        "num_workers": template_ld.num_workers,
+        "pin_memory": template_ld.pin_memory,
+    }
+    if eval_sampler is None:
+        loader_args["shuffle"] = False
+    else:
+        loader_args["sampler"] = eval_sampler
+    if template_ld.num_workers > 0:
+        loader_args["prefetch_factor"] = template_ld.prefetch_factor
+        loader_args["persistent_workers"] = template_ld.persistent_workers
+    return DataLoader(eval_ds, **loader_args)
+
+
+def retrieval_topk_accuracy(embeddings, pids, topk=VAL_EXTREME_TOPK,
+                            gallery_size=VAL_EXTREME_SAMPLE_SIZE,
+                            seed=VAL_EXTREME_SAMPLE_SEED,
+                            paths=None, report_k=None):
+    """检索式 top-k 正确率（向量化实现）。
+
+    对每张查询图，从全体中随机抽 gallery_size 张组成 gallery，
+    计算余弦相似度后：
+      - 取相似度最高的 top-k，看是否与查询同 person（正确率）
+      - 取相似度最低的 top-k，看是否与查询不同 person（正确率）
+    两侧正确率平均后再对所有查询取均值。
+
+    当 paths 不为 None 时，收集 report_k（默认取 topk 中最小值）
+    范围内的错误分类样本信息。
+    """
+    embs = torch.as_tensor(embeddings).detach().cpu().float()
+    pids = torch.as_tensor(pids).detach().cpu().long().flatten()
+    n = embs.size(0)
+    if n < 2:
+        return [0.0 for _ in topk], []
+
+    embs = F.normalize(embs, p=2, dim=1)
+    max_k = max(topk)
+    if report_k is None:
+        report_k = min(topk)
+
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+
+    if gallery_size is not None and gallery_size < n - 1:
+        gallery_indices = torch.zeros(n, gallery_size, dtype=torch.long)
+        for qi in range(n):
+            others = torch.cat([torch.arange(0, qi), torch.arange(qi + 1, n)])
+            perm = torch.randperm(others.numel(), generator=generator)[:gallery_size]
+            gallery_indices[qi] = others[perm]
+        g_size = gallery_size
+    else:
+        gallery_indices = None
+        g_size = n - 1
+
+    effective_k = min(max_k, g_size)
+    if effective_k <= 0:
+        return [0.0 for _ in topk], []
+
+    if gallery_indices is not None:
+        gallery_embs = embs[gallery_indices]                   # (n, g_size, dim)
+        sim_matrix = torch.bmm(gallery_embs, embs.unsqueeze(2)).squeeze(2)  # (n, g_size)
+        gallery_pids = pids[gallery_indices]                   # (n, g_size)
+        same_pid_matrix = gallery_pids == pids.unsqueeze(1)    # (n, g_size)
+    else:
+        sim_full = embs @ embs.t()                             # (n, n)
+        sim_full.fill_diagonal_(-float('inf'))
+        sim_matrix = sim_full
+        same_pid_matrix = pids.unsqueeze(0) == pids.unsqueeze(1)
+
+    top_high_sim, top_high_idx = torch.topk(sim_matrix, effective_k, dim=1, largest=True)
+    top_low_sim, top_low_idx = torch.topk(sim_matrix, effective_k, dim=1, largest=False)
+
+    pos_hits = same_pid_matrix.gather(1, top_high_idx).float()  # (n, effective_k)
+    neg_hits = (~same_pid_matrix).gather(1, top_low_idx).float()
+
+    scores = []
+    for k in topk:
+        ek = min(int(k), effective_k)
+        pos_acc = pos_hits[:, :ek].sum() / (n * ek)
+        neg_acc = neg_hits[:, :ek].sum() / (n * ek)
+        scores.append(((pos_acc + neg_acc) / 2).item())
+
+    errors = []
+    if paths is not None:
+        rk = min(report_k, effective_k)
+        pos_miss = ~same_pid_matrix.gather(1, top_high_idx[:, :rk])  # false positives
+        neg_miss = same_pid_matrix.gather(1, top_low_idx[:, :rk])    # false negatives
+
+        fp_qi, fp_j = torch.where(pos_miss)
+        for qi, j in zip(fp_qi.tolist(), fp_j.tolist()):
+            if gallery_indices is not None:
+                gi = gallery_indices[qi, top_high_idx[qi, j]].item()
+            else:
+                gi = top_high_idx[qi, j].item()
+            errors.append({
+                "type": "false_positive",
+                "query": paths[qi], "query_pid": pids[qi].item(),
+                "matched": paths[gi], "matched_pid": pids[gi].item(),
+                "similarity": top_high_sim[qi, j].item(),
+            })
+
+        fn_qi, fn_j = torch.where(neg_miss)
+        for qi, j in zip(fn_qi.tolist(), fn_j.tolist()):
+            if gallery_indices is not None:
+                gi = gallery_indices[qi, top_low_idx[qi, j]].item()
+            else:
+                gi = top_low_idx[qi, j].item()
+            errors.append({
+                "type": "false_negative",
+                "query": paths[qi], "query_pid": pids[qi].item(),
+                "matched": paths[gi], "matched_pid": pids[gi].item(),
+                "similarity": top_low_sim[qi, j].item(),
+            })
+
+        errors.sort(key=lambda e: e["similarity"], reverse=(errors[0]["type"] == "false_positive") if errors else True)
+
+    return scores, errors
+
+
+def _extract_single_embeddings(model, persons, img_size, device, batch_size=64,
+                               local_criterion=None, local_weight=0.3):
+    """用 SingleImageDataset 提取验证集每张图的 embedding、person_id 和路径。
+    
+    多卡环境下使用 DistributedSampler 分片，各卡只处理子集后 all_gather 合并。
+    """
+    ds = SingleImageDataset(persons, img_size=img_size)
+
+    if dist.is_initialized():
+        sampler = DistributedSampler(ds, shuffle=False)
+    else:
+        sampler = None
+
+    ld = DataLoader(ds, batch_size=batch_size, shuffle=False, drop_last=False,
+                    sampler=sampler,
+                    num_workers=4, pin_memory=torch.cuda.is_available())
+    local_module = None
+    if local_criterion is not None:
+        local_module = local_criterion.module if isinstance(local_criterion, DDP) else local_criterion
+
+    all_embs, all_pids, local_indices = [], [], []
+    for bx, bpid in ld:
+        bx = bx.to(device, non_blocking=True)
+        if local_module is None:
+            emb = model(bx)
+        else:
+            global_emb, local_feat = model(bx, return_local=True)
+            global_emb = F.normalize(global_emb, p=2, dim=1)
+
+            local_embs = []
+            for i, chunk in enumerate(torch.chunk(local_feat, local_module.splits, dim=2)):
+                le = chunk.mean(dim=[2, 3])
+                le = local_module.bns[i](le)
+                le = F.normalize(le, p=2, dim=1)
+                local_embs.append(le)
+            local_emb_avg = torch.stack(local_embs, dim=0).mean(dim=0)
+            emb = (1.0 - local_weight) * global_emb + local_weight * local_emb_avg
+
+        all_embs.append(emb.detach().cpu())
+        all_pids.append(bpid)
+
+    all_embs = torch.cat(all_embs)
+    all_pids = torch.cat(all_pids)
+
+    if dist.is_initialized():
+        gathered = [None] * world_size
+        dist.all_gather_object(gathered, {"emb": all_embs, "pid": all_pids})
+        all_embs = torch.cat([g["emb"] for g in gathered])
+        all_pids = torch.cat([g["pid"] for g in gathered])
+
+    return all_embs, all_pids, ds.paths
+
+
+@torch.no_grad()
+def evaluate(model:nn.Module, val_ld, device, split="val", local_criterion=None,
+             local_weight=0.3, calc_extreme_topk=False,
+             extreme_topk=VAL_EXTREME_TOPK,
+             extreme_sample_size=VAL_EXTREME_SAMPLE_SIZE):
+    model.eval()
+    local_module = None
+    local_training = False
+    if local_criterion is not None:
+        local_module = local_criterion.module if isinstance(local_criterion, DDP) else local_criterion
+        local_training = local_criterion.training
+        local_criterion.eval()
+    margin_cal = Margin_cal()
+    sims, labels = [], []
+    acc = torch.zeros(1, device=device)
+    margin = torch.zeros(1, device=device)
+    extreme_topk_tensor = torch.zeros(len(extreme_topk), dtype=torch.float32, device=device)
+
+    for bx1, bx2, by in val_ld:
+        bx1 = bx1.to(device, non_blocking=True)
+        bx2 = bx2.to(device, non_blocking=True)
+        by = by.to(device, non_blocking=True)
+        bx = torch.concat([bx1, bx2], dim=0)
+        if local_module is None:
+            emb = model(bx)
+            emb1, emb2 = torch.chunk(emb, 2, dim=0)
+            sim = F.cosine_similarity(emb1, emb2)
+        else:
+            global_emb, local_feat = model(bx, return_local=True)
+            global_emb = F.normalize(global_emb, p=2, dim=1)
+            emb1, emb2 = torch.chunk(global_emb, 2, dim=0)
+            sim_global = F.cosine_similarity(emb1, emb2)
+
+            local_sims = []
+            for i, chunk in enumerate(torch.chunk(local_feat, local_module.splits, dim=2)):
+                local_emb = chunk.mean(dim=[2, 3])
+                local_emb = local_module.bns[i](local_emb)
+                local_emb = F.normalize(local_emb, p=2, dim=1)
+                local_emb1, local_emb2 = torch.chunk(local_emb, 2, dim=0)
+                local_sims.append(F.cosine_similarity(local_emb1, local_emb2))
+            sim_local = torch.stack(local_sims, dim=0).mean(dim=0)
+            sim = (1.0 - local_weight) * sim_global + local_weight * sim_local
+
+        sims.append(sim.detach().cpu())
+        labels.append(by.detach().cpu())
+    sims, labels = torch.cat(sims), torch.cat(labels)
+
+    if dist.is_initialized():
+        gathered = [None] * world_size
+        dist.all_gather_object(gathered, {"sim": sims, "label": labels})
+        if is_main_process():
+            sims = torch.cat([g["sim"] for g in gathered])
+            labels = torch.cat([g["label"] for g in gathered])
+
+    all_paths = None
+    if calc_extreme_topk:
+        persons = val_ld.dataset.persons
+        img_size = val_ld.dataset.out_size
+        all_embs, all_pids, all_paths = _extract_single_embeddings(
+            model, persons, img_size, device,
+            batch_size=val_ld.batch_size,
+            local_criterion=local_criterion, local_weight=local_weight,
+        )
+
+    if is_main_process():
+        margin_value = margin_cal.margin(sim=sims, by=labels)
+        pred = sims >= margin_value
+        label_mask = labels == 1
+        acc = torch.tensor((pred == label_mask).float().mean().item(), device=device)
+        margin = torch.tensor(margin_value, dtype=torch.float32, device=device)
+        if calc_extreme_topk:
+            extreme_scores, errors = retrieval_topk_accuracy(
+                all_embs, all_pids,
+                topk=extreme_topk,
+                gallery_size=extreme_sample_size,
+                paths=all_paths,
+            )
+            extreme_topk_tensor = torch.tensor(extreme_scores, dtype=torch.float32, device=device)
+
+        pos_sim = sims[label_mask]
+        neg_sim = sims[~label_mask]
+        print(f"[{split}] True:")
+        if len(pos_sim) > 0:
+            print(pos_sim.min().item(), pos_sim.max().item(), pos_sim.mean().item())
+        else:
+            print("no positive pairs")
+        print(f"[{split}] False:")
+        if len(neg_sim) > 0:
+            print(neg_sim.min().item(), neg_sim.max().item(), neg_sim.mean().item())
+        else:
+            print("no negative pairs")
+        print(f"[{split}] margin: {margin_value}")
+        if calc_extreme_topk:
+            topk_msg = ", ".join(
+                f"top{k}: {score * 100:.2f}%"
+                for k, score in zip(extreme_topk, extreme_topk_tensor.tolist())
+            )
+            print(f"[{split}] retrieval {topk_msg}")
+            if errors:
+                fp = [e for e in errors if e["type"] == "false_positive"]
+                fn = [e for e in errors if e["type"] == "false_negative"]
+                fp.sort(key=lambda e: e["similarity"], reverse=True)
+                fn.sort(key=lambda e: e["similarity"])
+                print(f"[{split}] errors: {len(fp)} false_positive, {len(fn)} false_negative")
+                for e in fp[:10]:
+                    print(f"  FP sim={e['similarity']:.4f} | query(pid={e['query_pid']}): {e['query']}")
+                    print(f"     matched(pid={e['matched_pid']}): {e['matched']}")
+                for e in fn[:10]:
+                    print(f"  FN sim={e['similarity']:.4f} | query(pid={e['query_pid']}): {e['query']}")
+                    print(f"     matched(pid={e['matched_pid']}): {e['matched']}")
+    if dist.is_initialized():
+        dist.broadcast(acc, src=0)
+        dist.broadcast(margin, src=0)
+        dist.broadcast(extreme_topk_tensor, src=0)
+    if local_criterion is not None and local_training:
+        local_criterion.train()
+    return acc.item(), margin.item(), tuple(extreme_topk_tensor.cpu().tolist())
+
+
+class FaceSequential(nn.Sequential):
+    def forward(self, input, return_local=False):
+        for module in self:
+            if isinstance(module, ViT):
+                input = module(input, return_local=return_local)
+            else:
+                input = module(input)
+        return input
+
+def accuracy(output, target, topk=(1,)):
+    """Computes the accuracy over the k top predictions for the specified values of k"""
+    with torch.no_grad():
+        maxk = max(topk)
+        batch_size = target.size(0)
+
+        _, pred = output.topk(maxk, 1, True, True)
+        pred = pred.t()
+        correct = pred.eq(target.view(1, -1).expand_as(pred))
+
+        res = []
+        for k in topk:
+            correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
+            res.append(correct_k.mul_(100.0 / batch_size))
+        return res
+
+def train(model:nn.Module, train_ld, val_ld, device, criterion, local_criterion, supcon_criterion=None, supcon_weight=0.5, lr=2e-3, epochs=30, weight_decay=1e-4, resum=False):
+    criterion_module = criterion.module if isinstance(criterion, DDP) else criterion
+    local_criterion_module = local_criterion.module if isinstance(local_criterion, DDP) else local_criterion
+    optim_modules = [model, criterion_module, local_criterion_module]
+    if supcon_criterion is not None:
+        sc_module = supcon_criterion.module if isinstance(supcon_criterion, DDP) else supcon_criterion
+        optim_modules.append(sc_module)
+    optimizer = build_optim(nn.ModuleList(optim_modules), lr, weight_decay)
+    train_eval_ld = build_pair_eval_loader(train_ld, val_ld)
+    
+    warmup_epochs = 4
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.3, total_iters=warmup_epochs)
+    plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="max",
+        factor=0.5,
+        patience=3,
+        threshold=0.001,
+        min_lr=5e-6,
+    )
+    best_acc = 0.0
+    start_epoch = 1
+
+    if resum and all_state.exists():
+        ckpt = torch.load(all_state, map_location='cpu')
+        optimizer.load_state_dict(ckpt["optimizer"])
+        scheduler_state = ckpt.get("scheduler")
+        if isinstance(scheduler_state, dict) and "warmup" in scheduler_state and "plateau" in scheduler_state:
+            warmup_scheduler.load_state_dict(scheduler_state["warmup"])
+            plateau_scheduler.load_state_dict(scheduler_state["plateau"])
+        model.module.load_state_dict(ckpt["model"])
+        if "criterion" in ckpt:
+            criterion_module.load_state_dict(ckpt["criterion"])
+        if "local_criterion" in ckpt:
+            local_criterion_module.load_state_dict(ckpt["local_criterion"])
+        best_acc = ckpt["best_acc"]
+        start_epoch = ckpt["epoch"]
+
+    for p in model.parameters():
+        dist.broadcast(p.data, src=0) if dist.is_initialized() else None
+
+    scaler = GradScaler("cuda")
+    for epoch in range(start_epoch, epochs + 1):
+        model.train()
+        if isinstance(train_ld.sampler, DistributedSampler):
+            train_ld.sampler.set_epoch(epoch)
+        if hasattr(train_ld.dataset, 'set_epoch'):
+            train_ld.dataset.set_epoch(epoch)
+        
+        loss_avg = 0
+        supcon_avg = 0
+        top1_avg, top10_avg, top100_avg = 0, 0, 0
+
+        for bx, by in tqdm(train_ld, disable=not is_main_process()):
+            bx = bx.to(device, non_blocking=True)
+            by = by.to(device, non_blocking=True)
+            with autocast("cuda"):
+                global_emb, local_feat = model(bx, return_local=True)
+                loss_global, logits = criterion(global_emb, by)
+                loss_local = local_criterion(local_feat, by)
+                loss = loss_global + 0.6 * loss_local
+                
+                if supcon_criterion is not None:
+                    loss_supcon = supcon_criterion(global_emb, by)
+                    loss = loss + supcon_weight * loss_supcon
+                    supcon_avg += loss_supcon.item()
+            
+            with torch.no_grad():
+                acc1, acc10, acc100 = accuracy(logits, by, topk=(1, 10, 100))
+                top1_avg += acc1.item()
+                top10_avg += acc10.item()
+                top100_avg += acc100.item()
+                
+            optimizer.zero_grad()
+            scaler.scale(loss).backward()
+            
+            # 在进行梯度裁剪前必须先 unscale，否则裁剪的是放大后的梯度
+            scaler.unscale_(optimizer)
+            
+            # 在训练前期极易发生梯度爆炸导致网络摆烂，加上梯度裁剪
+            all_params = list(model.parameters()) + list(criterion.parameters()) + list(local_criterion.parameters())
+            torch.nn.utils.clip_grad_norm_(all_params, max_norm=5.0)
+            
+            scaler.step(optimizer)
+            scaler.update()
+            loss_avg += loss.item()
+
+        loss_tensor = torch.tensor([loss_avg, top1_avg, top10_avg, top100_avg, supcon_avg], device=device)
+        if dist.is_initialized():
+            dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+            loss_tensor /= world_size
+        
+        loss_avg = loss_tensor[0].item() / len(train_ld)
+        top1_avg = loss_tensor[1].item() / len(train_ld)
+        top10_avg = loss_tensor[2].item() / len(train_ld)
+        top100_avg = loss_tensor[3].item() / len(train_ld)
+        supcon_avg = loss_tensor[4].item() / len(train_ld)
+
+        train_acc, _, _ = evaluate(model, train_eval_ld, device, split="train", local_criterion=local_criterion)
+        acc, margin, val_topk = evaluate(
+            model,
+            val_ld,
+            device,
+            split="val",
+            local_criterion=local_criterion,
+            calc_extreme_topk=True,
+        )
+        if epoch <= warmup_epochs:
+            warmup_scheduler.step()
+        else:
+            plateau_scheduler.step(acc)
+
+        if is_main_process() and acc > best_acc:
+            best_acc = acc
+            all_state.parent.mkdir(parents=True, exist_ok=True)
+            torch.save({"optimizer": optimizer.state_dict(), 
+                    "scheduler": {
+                        "warmup": warmup_scheduler.state_dict(),
+                        "plateau": plateau_scheduler.state_dict(),
+                    }, "model": model.module.state_dict(),
+                "criterion": criterion_module.state_dict(),
+                "local_criterion": local_criterion_module.state_dict(),
+                "best_acc": best_acc, "epoch": epoch + 1, "margin": margin}, all_state)
+        if is_main_process():
+            writer.add_scalar("lr/epoch", optimizer.param_groups[0]["lr"], epoch)
+            writer.add_scalar("loss/epoch", loss_avg, epoch)
+            if supcon_criterion is not None:
+                writer.add_scalar("supcon_loss/epoch", supcon_avg, epoch)
+            writer.add_scalar("train_acc/epoch", train_acc, epoch)
+            writer.add_scalar("train_top1/epoch", top1_avg, epoch)
+            writer.add_scalar("train_top10/epoch", top10_avg, epoch)
+            writer.add_scalar("train_top100/epoch", top100_avg, epoch)
+            writer.add_scalar("acc/epoch", acc, epoch)
+            for k, score in zip(VAL_EXTREME_TOPK, val_topk):
+                writer.add_scalar(f"val_top{k}/epoch", score * 100.0, epoch)
+        
+        if is_main_process() and epoch % max(1, epochs // 200) == 0:
+            val_topk_msg = ", ".join(
+                f"val_top{k}: {score * 100:.2f}%"
+                for k, score in zip(VAL_EXTREME_TOPK, val_topk)
+            )
+            supcon_msg = f", supcon: {supcon_avg:.4f}" if supcon_criterion is not None else ""
+            print(f"  ========== epoch: {epoch} ==========\nloss: {loss_avg:.4f}{supcon_msg}, train_acc: {train_acc:.4f}, val_acc: {acc:.4f}\n"
+                  f"train_top1: {top1_avg:.2f}%, train_top10: {top10_avg:.2f}%, train_top100: {top100_avg:.2f}%\n"
+                  f"{val_topk_msg}\n")
+
+    return True
+    
+
+if __name__ == "__main__":
+    local_rank = setup_ddp()
+    if dist.is_initialized(): world_size = dist.get_world_size()
+    torch.backends.cudnn.benchmark = True
+
+    if is_main_process(): writer = SummaryWriter(log_dir=log_path)
+
+    data_process = Process(train_num=80000, val_num=4000, device=device)
+    train_ld, val_ld = data_process.loader(
+        world_size=world_size, rank=local_rank, batch_size=400,
+        num_worker=16, prefetch_factor=2
+    )
+    
+    model = FaceSequential(CowResNet(), ViT(count=112, emb_dim=512)).to(device)
+    model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+    model = DDP(model, device_ids=[local_rank] if torch.cuda.is_available() else None)
+
+    criterion = ArcFaceLoss(512, data_process.num_train, label_smoothing=LABEL_SMOOTHING).to(device)
+    criterion = DDP(criterion, device_ids=[local_rank] if torch.cuda.is_available() else None)
+    
+    local_criterion = LocalSplitArcFaceLoss(
+        512, data_process.num_train, splits=2, label_smoothing=LABEL_SMOOTHING
+    ).to(device)
+    local_criterion = DDP(local_criterion, device_ids=[local_rank] if torch.cuda.is_available() else None)
+
+    supcon_criterion = SupConLoss(temperature=0.07).to(device)
+
+    train(model, train_ld, val_ld, device, criterion, local_criterion,
+          supcon_criterion=supcon_criterion, supcon_weight=0.5, resum=False)
+
+    if dist.is_initialized(): dist.destroy_process_group()
+
+
+
+
