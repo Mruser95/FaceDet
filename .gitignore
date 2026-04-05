@@ -1,17 +1,9 @@
 FaceNetPack/Dataset/*
 ObjDetARec/*
-sam/*
 
 # Python
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
 
 # macOS
 .DS_Store
-.AppleDouble
-.LSOverride
 ._*
-.Spotlight-V100
-.Trashes
