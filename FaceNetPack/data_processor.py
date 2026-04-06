@@ -10,13 +10,19 @@ import random
 import re
 import numpy as np
 
-dataroot = Path(__file__).resolve().parents[1] / "Dataset" / "325_crop"
-_fallback_root = Path(__file__).resolve().parents[1] / "Dataset" / "325"
+_sam_root = Path(__file__).resolve().parent / "Dataset" / "325_sam"
+dataroot = Path(__file__).resolve().parent / "Dataset" / "325_crop"
+_fallback_root = Path(__file__).resolve().parent / "Dataset" / "325"
 
 
 def read_dataset(root=None):
     if root is None:
-        root = dataroot if dataroot.exists() else _fallback_root
+        for _candidate in [dataroot, _sam_root, _fallback_root]:
+            if _candidate.exists():
+                root = _candidate
+                break
+        else:
+            root = _fallback_root
     num_re = re.compile(r"(\d+)$")
 
     def extract_id(stem: str):

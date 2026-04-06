@@ -1,6 +1,6 @@
 import matplotlib.pyplot as plt
 import numpy as np
-from FaceNetPack.data_processor.img2img import Process
+from FaceNetPack.data_processor import Process
 from FaceNetPack.Model.Backbone import CowResNet
 from FaceNetPack.Model.VisionTransformer import ViT
 import torch

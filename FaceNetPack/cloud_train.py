@@ -1,7 +1,7 @@
 from FaceNetPack.Model.Backbone import CowResNet
 from FaceNetPack.Model.ArcFace import ArcFaceLoss, LocalSplitArcFaceLoss, SupConLoss, build_optim
 from FaceNetPack.Model.VisionTransformer import ViT
-from FaceNetPack.data_processor.img2img import Process, dataset as FaceDataset, SingleImageDataset
+from FaceNetPack.data_processor import Process, dataset as FaceDataset, SingleImageDataset
 import torch
 import torch.nn as nn
 import torch.distributed as dist

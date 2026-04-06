@@ -17,7 +17,7 @@ from torch.utils.data import Dataset, DataLoader
 
 
 _project_root = Path(__file__).resolve().parents[1]
-_default_src = Path(__file__).resolve().parent / "Dataset" / "325"
+_default_src = Path(__file__).resolve().parent / "Dataset" / "325_sam"
 _default_dst = Path(__file__).resolve().parent / "Dataset" / "325_crop"
 
 
