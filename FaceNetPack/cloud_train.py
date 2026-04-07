@@ -19,8 +19,7 @@ all_state = Path(__file__).resolve().parent / "State" / "cloud_model.pth"
 log_path = Path(__file__).resolve().parents[1] / "tf-logs" / "cloud_model" #modified
 writer = None
 LABEL_SMOOTHING = 0.0
-VAL_EXTREME_TOPK = (1, 10, 100)
-VAL_EXTREME_SAMPLE_SIZE = 500
+VAL_EXTREME_TOPK = (1, 5, 10)
 VAL_EXTREME_SAMPLE_SEED = 0
 
 def setup_ddp():
@@ -71,19 +70,14 @@ def build_pair_eval_loader(source_ld, template_ld):
 
 
 def retrieval_topk_accuracy(embeddings, pids, topk=VAL_EXTREME_TOPK,
-                            gallery_size=VAL_EXTREME_SAMPLE_SIZE,
                             seed=VAL_EXTREME_SAMPLE_SEED,
                             paths=None, report_k=None):
-    """检索式 top-k 正确率（向量化实现）。
+    """检索式 Recall@K（gallery / query 分离）。
 
-    对每张查询图，从全体中随机抽 gallery_size 张组成 gallery，
-    计算余弦相似度后：
-      - 取相似度最高的 top-k，看是否与查询同 person（正确率）
-      - 取相似度最低的 top-k，看是否与查询不同 person（正确率）
-    两侧正确率平均后再对所有查询取均值。
-
-    当 paths 不为 None 时，收集 report_k（默认取 topk 中最小值）
-    范围内的错误分类样本信息。
+    每个身份随机抽一张图作 gallery，剩余图片作 query。
+    对每个 query 计算与所有 gallery 图片的余弦相似度，按降序排序，
+    若 top-k 中包含与 query 同身份的 gallery 图片则视为命中。
+    最终返回各 k 值的 Recall@K。
     """
     embs = torch.as_tensor(embeddings).detach().cpu().float()
     pids = torch.as_tensor(pids).detach().cpu().long().flatten()
@@ -92,85 +86,62 @@ def retrieval_topk_accuracy(embeddings, pids, topk=VAL_EXTREME_TOPK,
         return [0.0 for _ in topk], []
 
     embs = F.normalize(embs, p=2, dim=1)
-    max_k = max(topk)
     if report_k is None:
         report_k = min(topk)
 
-    generator = torch.Generator()
-    generator.manual_seed(seed)
+    rng = torch.Generator()
+    rng.manual_seed(seed)
 
-    if gallery_size is not None and gallery_size < n - 1:
-        gallery_indices = torch.zeros(n, gallery_size, dtype=torch.long)
-        for qi in range(n):
-            others = torch.cat([torch.arange(0, qi), torch.arange(qi + 1, n)])
-            perm = torch.randperm(others.numel(), generator=generator)[:gallery_size]
-            gallery_indices[qi] = others[perm]
-        g_size = gallery_size
-    else:
-        gallery_indices = None
-        g_size = n - 1
+    unique_pids = pids.unique()
+    gallery_idx_list, query_idx_list = [], []
+    for pid in unique_pids:
+        indices = (pids == pid).nonzero(as_tuple=True)[0]
+        perm = torch.randperm(indices.numel(), generator=rng)
+        gallery_idx_list.append(indices[perm[0]].item())
+        query_idx_list.extend(indices[perm[1:]].tolist())
 
-    effective_k = min(max_k, g_size)
-    if effective_k <= 0:
+    if not query_idx_list:
         return [0.0 for _ in topk], []
 
-    if gallery_indices is not None:
-        gallery_embs = embs[gallery_indices]                   # (n, g_size, dim)
-        sim_matrix = torch.bmm(gallery_embs, embs.unsqueeze(2)).squeeze(2)  # (n, g_size)
-        gallery_pids = pids[gallery_indices]                   # (n, g_size)
-        same_pid_matrix = gallery_pids == pids.unsqueeze(1)    # (n, g_size)
-    else:
-        sim_full = embs @ embs.t()                             # (n, n)
-        sim_full.fill_diagonal_(-float('inf'))
-        sim_matrix = sim_full
-        same_pid_matrix = pids.unsqueeze(0) == pids.unsqueeze(1)
+    gallery_idx = torch.tensor(gallery_idx_list, dtype=torch.long)
+    query_idx = torch.tensor(query_idx_list, dtype=torch.long)
 
-    top_high_sim, top_high_idx = torch.topk(sim_matrix, effective_k, dim=1, largest=True)
-    top_low_sim, top_low_idx = torch.topk(sim_matrix, effective_k, dim=1, largest=False)
+    gallery_embs = embs[gallery_idx]          # (G, dim)
+    query_embs = embs[query_idx]              # (Q, dim)
+    gallery_pids = pids[gallery_idx]          # (G,)
+    query_pids = pids[query_idx]              # (Q,)
 
-    pos_hits = same_pid_matrix.gather(1, top_high_idx).float()  # (n, effective_k)
-    neg_hits = (~same_pid_matrix).gather(1, top_low_idx).float()
+    sim_matrix = query_embs @ gallery_embs.t()  # (Q, G)
 
+    _, sorted_gallery = sim_matrix.sort(dim=1, descending=True)
+    sorted_pids = gallery_pids[sorted_gallery]  # (Q, G)
+    hits = sorted_pids == query_pids.unsqueeze(1)  # (Q, G)
+
+    num_queries = query_idx.numel()
+    num_gallery = gallery_idx.numel()
     scores = []
     for k in topk:
-        ek = min(int(k), effective_k)
-        pos_acc = pos_hits[:, :ek].sum() / (n * ek)
-        neg_acc = neg_hits[:, :ek].sum() / (n * ek)
-        scores.append(((pos_acc + neg_acc) / 2).item())
+        ek = min(int(k), num_gallery)
+        recall = hits[:, :ek].any(dim=1).float().sum() / num_queries
+        scores.append(recall.item())
 
     errors = []
     if paths is not None:
-        rk = min(report_k, effective_k)
-        pos_miss = ~same_pid_matrix.gather(1, top_high_idx[:, :rk])  # false positives
-        neg_miss = same_pid_matrix.gather(1, top_low_idx[:, :rk])    # false negatives
-
-        fp_qi, fp_j = torch.where(pos_miss)
-        for qi, j in zip(fp_qi.tolist(), fp_j.tolist()):
-            if gallery_indices is not None:
-                gi = gallery_indices[qi, top_high_idx[qi, j]].item()
-            else:
-                gi = top_high_idx[qi, j].item()
+        rk = min(int(report_k), num_gallery)
+        missed = ~hits[:, :rk].any(dim=1)  # (Q,) 在 top-rk 中未命中的 query
+        for qi_local in missed.nonzero(as_tuple=True)[0].tolist():
+            qi_global = query_idx[qi_local].item()
+            best_wrong_local = sorted_gallery[qi_local, 0].item()
+            gi_global = gallery_idx[best_wrong_local].item()
             errors.append({
-                "type": "false_positive",
-                "query": paths[qi], "query_pid": pids[qi].item(),
-                "matched": paths[gi], "matched_pid": pids[gi].item(),
-                "similarity": top_high_sim[qi, j].item(),
+                "type": "miss",
+                "query": paths[qi_global],
+                "query_pid": query_pids[qi_local].item(),
+                "matched": paths[gi_global],
+                "matched_pid": gallery_pids[best_wrong_local].item(),
+                "similarity": sim_matrix[qi_local, best_wrong_local].item(),
             })
-
-        fn_qi, fn_j = torch.where(neg_miss)
-        for qi, j in zip(fn_qi.tolist(), fn_j.tolist()):
-            if gallery_indices is not None:
-                gi = gallery_indices[qi, top_low_idx[qi, j]].item()
-            else:
-                gi = top_low_idx[qi, j].item()
-            errors.append({
-                "type": "false_negative",
-                "query": paths[qi], "query_pid": pids[qi].item(),
-                "matched": paths[gi], "matched_pid": pids[gi].item(),
-                "similarity": top_low_sim[qi, j].item(),
-            })
-
-        errors.sort(key=lambda e: e["similarity"], reverse=(errors[0]["type"] == "false_positive") if errors else True)
+        errors.sort(key=lambda e: e["similarity"], reverse=True)
 
     return scores, errors
 
@@ -231,8 +202,7 @@ def _extract_single_embeddings(model, persons, img_size, device, batch_size=64,
 @torch.no_grad()
 def evaluate(model:nn.Module, val_ld, device, split="val", local_criterion=None,
              local_weight=0.3, calc_extreme_topk=False,
-             extreme_topk=VAL_EXTREME_TOPK,
-             extreme_sample_size=VAL_EXTREME_SAMPLE_SIZE):
+             extreme_topk=VAL_EXTREME_TOPK):
     model.eval()
     local_module = None
     local_training = False
@@ -302,7 +272,6 @@ def evaluate(model:nn.Module, val_ld, device, split="val", local_criterion=None,
             extreme_scores, errors = retrieval_topk_accuracy(
                 all_embs, all_pids,
                 topk=extreme_topk,
-                gallery_size=extreme_sample_size,
                 paths=all_paths,
             )
             extreme_topk_tensor = torch.tensor(extreme_scores, dtype=torch.float32, device=device)
@@ -327,17 +296,10 @@ def evaluate(model:nn.Module, val_ld, device, split="val", local_criterion=None,
             )
             print(f"[{split}] retrieval {topk_msg}")
             if errors:
-                fp = [e for e in errors if e["type"] == "false_positive"]
-                fn = [e for e in errors if e["type"] == "false_negative"]
-                fp.sort(key=lambda e: e["similarity"], reverse=True)
-                fn.sort(key=lambda e: e["similarity"])
-                print(f"[{split}] errors: {len(fp)} false_positive, {len(fn)} false_negative")
-                for e in fp[:10]:
-                    print(f"  FP sim={e['similarity']:.4f} | query(pid={e['query_pid']}): {e['query']}")
-                    print(f"     matched(pid={e['matched_pid']}): {e['matched']}")
-                for e in fn[:10]:
-                    print(f"  FN sim={e['similarity']:.4f} | query(pid={e['query_pid']}): {e['query']}")
-                    print(f"     matched(pid={e['matched_pid']}): {e['matched']}")
+                print(f"[{split}] retrieval misses: {len(errors)}")
+                for e in errors[:10]:
+                    print(f"  MISS sim={e['similarity']:.4f} | query(pid={e['query_pid']}): {e['query']}")
+                    print(f"       top1(pid={e['matched_pid']}): {e['matched']}")
     if dist.is_initialized():
         dist.broadcast(acc, src=0)
         dist.broadcast(margin, src=0)
