@@ -14,6 +14,11 @@ from tqdm import tqdm
 from torch.amp import autocast, GradScaler
 from torch.utils.tensorboard import SummaryWriter
 from FaceNetPack.Model.MarginModel import Margin_cal
+from FaceNetPack.xgboost_verifier import (
+    collect_features_and_labels, train_xgboost, evaluate_xgboost,
+    print_feature_importance, XGB_STATE_PATH, FEATURE_NAMES,
+)
+import pickle
 
 all_state = Path(__file__).resolve().parent / "State" / "cloud_model.pth"
 log_path = Path(__file__).resolve().parents[1] / "tf-logs" / "cloud_model" #modified
@@ -480,6 +485,29 @@ def train(model:nn.Module, train_ld, val_ld, device, criterion, local_criterion,
                   f"train_top1: {top1_avg:.2f}%, train_top10: {top10_avg:.2f}%, train_top100: {top100_avg:.2f}%\n"
                   f"{val_topk_msg}\n")
 
+        if is_main_process() and epoch % 5 == 0:
+            try:
+                print(f"[xgb] Training XGBoost at epoch {epoch}...")
+                X_train_xgb, y_train_xgb = collect_features_and_labels(
+                    model, local_criterion, train_eval_ld, device)
+                X_val_xgb, y_val_xgb = collect_features_and_labels(
+                    model, local_criterion, val_ld, device)
+                bst = train_xgboost(X_train_xgb, y_train_xgb, X_val_xgb, y_val_xgb)
+                print("[xgb] Val evaluation:")
+                evaluate_xgboost(bst, X_val_xgb, y_val_xgb)
+                print_feature_importance(bst)
+                XGB_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+                with open(XGB_STATE_PATH, "wb") as f:
+                    pickle.dump(bst, f)
+                if writer is not None:
+                    import xgboost as xgb
+                    dval = xgb.DMatrix(X_val_xgb, feature_names=FEATURE_NAMES[:X_val_xgb.shape[1]])
+                    xgb_preds = (bst.predict(dval) >= 0.5).astype(int)
+                    xgb_acc = (xgb_preds == y_val_xgb).mean()
+                    writer.add_scalar("xgb_val_acc/epoch", xgb_acc, epoch)
+            except Exception as e:
+                print(f"[xgb] Skipped: {e}")
+
     return True
     
 
@@ -490,9 +518,9 @@ if __name__ == "__main__":
 
     if is_main_process(): writer = SummaryWriter(log_dir=log_path)
 
-    data_process = Process(train_num=80000, val_num=4000, device=device)
+    data_process = Process(train_num=32000, val_num=1600, device=device)
     train_ld, val_ld = data_process.loader(
-        world_size=world_size, rank=local_rank, batch_size=400,
+        world_size=world_size, rank=local_rank, batch_size=320,
         num_worker=16, prefetch_factor=2
     )
     

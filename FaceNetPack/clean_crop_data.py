@@ -20,9 +20,23 @@ _default_root = Path(__file__).resolve().parent / "Dataset" / "325_crop"
 MIN_CROP_AREA = 6000
 MIN_CROP_DIM = 50
 MIN_CONTENT_RATIO = 0.15
+MAX_DEPTH_MEAN = 2500
 
 
-def scan(root, min_area, min_dim, min_content):
+def _find_depth_path(color_path: Path) -> Path | None:
+    """根据 color 路径推断对应的 depth 路径。"""
+    stem = color_path.stem
+    fid = stem.split("_")[-1]
+    prefix = "_".join(stem.split("_")[:-2])
+    depth_dir = color_path.parent.parent / "depth"
+    for ext in [".png", ".jpg"]:
+        dp = depth_dir / f"{prefix}_depth_{fid}{ext}"
+        if dp.exists():
+            return dp
+    return None
+
+
+def scan(root, min_area, min_dim, min_content, max_depth=MAX_DEPTH_MEAN):
     bad = []
     total = 0
     for color_path in sorted(root.rglob("color/*")):
@@ -47,6 +61,14 @@ def scan(root, min_area, min_dim, min_content):
         if ratio < min_content:
             reasons.append(f"content={ratio:.3f}<{min_content}")
 
+        if max_depth > 0:
+            dp = _find_depth_path(color_path)
+            if dp is not None:
+                d_arr = np.array(Image.open(dp), dtype=np.float32)
+                d_valid = d_arr[d_arr > 0]
+                if d_valid.size > 0 and d_valid.mean() > max_depth:
+                    reasons.append(f"depth={d_valid.mean():.0f}>{max_depth}")
+
         if reasons:
             bad.append((color_path, ", ".join(reasons)))
 
@@ -59,11 +81,13 @@ def main():
     parser.add_argument("--min-area", type=int, default=MIN_CROP_AREA)
     parser.add_argument("--min-dim", type=int, default=MIN_CROP_DIM)
     parser.add_argument("--min-content", type=float, default=MIN_CONTENT_RATIO)
+    parser.add_argument("--max-depth", type=float, default=MAX_DEPTH_MEAN,
+                        help="深度均值超过此阈值的图片视为远景/非目标 (默认 2500)")
     parser.add_argument("--delete", action="store_true", help="实际删除坏图")
     args = parser.parse_args()
 
     print(f"扫描目录: {args.root}")
-    total, bad = scan(args.root, args.min_area, args.min_dim, args.min_content)
+    total, bad = scan(args.root, args.min_area, args.min_dim, args.min_content, args.max_depth)
 
     print(f"总计: {total} 张, 低质量: {len(bad)} 张 ({len(bad) / max(total, 1) * 100:.1f}%)")
     for path, reason in bad[:30]:
