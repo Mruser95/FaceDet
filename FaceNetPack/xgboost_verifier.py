@@ -86,7 +86,8 @@ def extract_pair_features(emb1, emb2, local_feat1=None, local_feat2=None,
             local_l2 = (le1 - le2).norm(p=2, dim=1)
             feats.extend([local_cos, local_l2])
 
-    return torch.stack(feats, dim=1).detach().cpu().numpy()
+    # 留在 GPU 上返回，由 caller 决定何时一次性同步到 CPU
+    return torch.stack(feats, dim=1).detach()
 
 
 FEATURE_NAMES = [
@@ -127,10 +128,11 @@ def collect_features_and_labels(model, local_criterion, dataloader, device):
             feats = extract_pair_features(emb1, emb2)
 
         all_feats.append(feats)
-        all_labels.append(by.numpy())
+        all_labels.append(by)
 
-    X = np.concatenate(all_feats, axis=0)
-    y = np.concatenate(all_labels, axis=0).astype(np.int32)
+    # 单次 cat + 一次性同步到 CPU，避免每个 batch 都触发 GPU→CPU 拷贝同步
+    X = torch.cat(all_feats, dim=0).cpu().numpy()
+    y = torch.cat(all_labels, dim=0).numpy().astype(np.int32)
     return X, y
 
 
@@ -253,7 +255,8 @@ class XGBVerifier:
             emb1, emb2 = torch.chunk(emb, 2, dim=0)
             feats = extract_pair_features(emb1, emb2)
 
-        dmat = xgb.DMatrix(feats, feature_names=FEATURE_NAMES[:feats.shape[1]])
+        feats_np = feats.cpu().numpy()
+        dmat = xgb.DMatrix(feats_np, feature_names=FEATURE_NAMES[:feats_np.shape[1]])
         probs = self.bst.predict(dmat)
         preds = (probs >= 0.5).astype(np.int32)
         return probs, preds

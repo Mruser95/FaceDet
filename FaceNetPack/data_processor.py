@@ -19,6 +19,10 @@ MIN_CROP_DIM = 50
 MIN_CONTENT_RATIO = 0.15
 MAX_DEPTH_MEAN = 2500
 
+# 复用同一组 transform 实例可省掉每张图片的对象构造开销
+_TO_TENSOR = transforms.ToTensor()
+_NORMALIZE_4CH = transforms.Normalize(mean=[0.5] * 4, std=[0.5] * 4)
+
 
 def _is_valid_image(color_path, depth_path=None, min_area=MIN_CROP_AREA,
                     min_dim=MIN_CROP_DIM, min_content=MIN_CONTENT_RATIO,
@@ -133,30 +137,25 @@ def _apply_train_augment(img4: torch.Tensor, out_size, rng: random.Random):
 
 def _load_pair(img, out_size, train=False, rng=None):
     color_path, depth_path = img
-    color = Image.open(color_path).convert("RGB")
-    depth = Image.open(depth_path)
+    with Image.open(color_path) as color_img:
+        color = _TO_TENSOR(color_img.convert("RGB"))
+    with Image.open(depth_path) as depth_img:
+        if depth_img.mode != "I;16":
+            depth = _TO_TENSOR(depth_img)
+        else:
+            arr = np.array(depth_img, dtype=np.float32)
+            arr = arr / 65535.0 if arr.max() > 1 else arr
+            depth = torch.from_numpy(arr).unsqueeze(0)
 
     if rng is None:
         rng = random.Random()
 
-    to_tensor = transforms.ToTensor()
-    normalize = transforms.Normalize(mean=[0.5]*4, std=[0.5]*4)
-
-    color = to_tensor(color)
-    if depth.mode != "I;16":
-        depth = to_tensor(depth)
-    else:
-        arr = np.array(depth, dtype=np.float32)
-        arr = arr / 65535.0 if arr.max() > 1 else arr
-        depth = torch.from_numpy(arr).unsqueeze(0)
-
     img4 = torch.cat([color, depth], dim=0)
-    img4 = TF.resize(img4, out_size, interpolation=InterpolationMode.BILINEAR)
+    img4 = TF.resize(img4, out_size, interpolation=InterpolationMode.BILINEAR, antialias=True)
     if train:
         # 几何增强必须对 RGB 和 depth 同步，避免四通道错位。
         img4 = _apply_train_augment(img4, out_size, rng)
-    img4 = normalize(img4)
-    return img4
+    return _NORMALIZE_4CH(img4)
 
 
 class dataset(Dataset):

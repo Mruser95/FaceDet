@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -36,22 +38,22 @@ class ArcFaceLoss(nn.Module):
             cos = torch.clamp(cos, -1.0 + 1e-7, 1.0 - 1e-7)
 
             # 避免使用 acos，采用官方 ArcFace 余弦展开公式以保证数值稳定
-            import math
             cos_m = math.cos(self.m)
             sin_m = math.sin(self.m)
             th = math.cos(math.pi - self.m)
             mm = math.sin(math.pi - self.m) * self.m
-            
+
             sine = torch.sqrt(1.0 - torch.pow(cos, 2)).clamp(min=1e-7)
             phi = cos * cos_m - sine * sin_m
             target_logits = torch.where(cos > th, phi, cos - mm)
-            
-            one_hot = F.one_hot(label.long(), num_classes=self.classes).float().to(emb.device)
 
-            logits = cos * (1.0 - one_hot) + target_logits * one_hot
+            # 用 scatter_ 直接写入目标列，省掉 [B, classes] 大小的 one_hot tensor 分配
+            label_idx = label.long().unsqueeze(1)
+            logits = cos.clone()
+            logits.scatter_(1, label_idx, target_logits.gather(1, label_idx))
             logits = logits * self.s
             loss = F.cross_entropy(logits, label.long(), label_smoothing=self.label_smoothing)
-            
+
             # 预测用的原始 logits，不加 margin 惩罚
             original_logits = cos * self.s
         return loss, original_logits

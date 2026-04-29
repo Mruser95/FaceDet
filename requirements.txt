@@ -1,0 +1,12 @@
+torch
+torchvision
+transformers
+safetensors
+timm
+numpy
+pillow
+opencv-python
+matplotlib
+tqdm
+tensorboard
+xgboost

@@ -33,7 +33,16 @@ def build_detector(device):
     print(f"Loading DETR from {model_path}")
     processor = AutoImageProcessor.from_pretrained(model_path, use_fast=False)
     model = AutoModelForObjectDetection.from_pretrained(model_path).to(device).eval()
+    if str(device).startswith("cuda"):
+        # CNN backbone 在 NHWC + AMP 下显著更快
+        model = model.to(memory_format=torch.channels_last)
     return processor, model
+
+
+def _autocast_dtype(device):
+    if str(device).startswith("cuda") and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float16
 
 
 def read_dataset(root):
@@ -181,6 +190,12 @@ def main():
         print(f"已启用回退源: {fallback_root}")
 
     processor, model = build_detector(args.device)
+    use_cuda = str(args.device).startswith("cuda")
+    if use_cuda:
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    amp_dtype = _autocast_dtype(args.device)
     pairs = read_dataset(args.src)
     print(f"共找到 {len(pairs)} 对 color/depth 图片")
 
@@ -219,9 +234,11 @@ def main():
     with executor_cm as executor:
         for inputs, target_sizes, color_imgs, color_paths, depth_paths, used_fallbacks in tqdm(dataloader, desc="检测 & 裁切"):
             inputs = {k: v.to(args.device, non_blocking=True) for k, v in inputs.items()}
+            if use_cuda and "pixel_values" in inputs:
+                inputs["pixel_values"] = inputs["pixel_values"].contiguous(memory_format=torch.channels_last)
             target_sizes = target_sizes.to(args.device, non_blocking=True)
 
-            with torch.no_grad():
+            with torch.inference_mode(), torch.autocast("cuda", dtype=amp_dtype, enabled=use_cuda):
                 outputs = model(**inputs)
                 results = processor.post_process_object_detection(
                     outputs, target_sizes=target_sizes, threshold=args.threshold

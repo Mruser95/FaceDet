@@ -24,13 +24,16 @@ class DropPathTransformerEncoderLayer(nn.Module):
 
     def forward(self, src, src_mask=None, src_key_padding_mask=None, is_causal=False):
         x = src
+        # 复用同一个 norm1 结果作为 q/k/v；q is k is v 让 SDPA 走 self-attention 快路径
+        pre_attn = self.base.norm1(x)
         sa_out = self.base.self_attn(
-            self.base.norm1(x), self.base.norm1(x), self.base.norm1(x),
+            pre_attn, pre_attn, pre_attn,
             attn_mask=src_mask, key_padding_mask=src_key_padding_mask,
             need_weights=False,
         )[0]
         x = x + self.drop_path(self.base.dropout1(sa_out))
-        ff_out = self.base.linear2(self.base.dropout(self.base.activation(self.base.linear1(self.base.norm2(x)))))
+        pre_ff = self.base.norm2(x)
+        ff_out = self.base.linear2(self.base.dropout(self.base.activation(self.base.linear1(pre_ff))))
         x = x + self.drop_path(self.base.dropout2(ff_out))
         return x
 

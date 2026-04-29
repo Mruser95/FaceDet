@@ -38,6 +38,9 @@ def build_sam(model_id: str, device: str):
     processor = SamProcessor.from_pretrained(model_id)
     model = SamModel.from_pretrained(model_id).to(device)
     model.eval()
+    if str(device).startswith("cuda"):
+        # SAM 内部 patch_embed 用 Conv2d；NHWC 配合 AMP 可让 patch_embed 走 TensorCore
+        model = model.to(memory_format=torch.channels_last)
     print("SAM loaded.")
     return processor, model
 
@@ -309,6 +312,11 @@ def main():
     args = parser.parse_args()
 
     skip_existing = not args.no_skip_existing
+
+    if str(args.device).startswith("cuda"):
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
     sam_proc, sam_model = build_sam(args.model_id, args.device)
     pairs = read_dataset(args.src)

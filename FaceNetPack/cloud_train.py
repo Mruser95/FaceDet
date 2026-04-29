@@ -27,6 +27,17 @@ LABEL_SMOOTHING = 0.0
 VAL_EXTREME_TOPK = (1, 5, 10)
 VAL_EXTREME_SAMPLE_SEED = 0
 
+
+def _select_amp_dtype():
+    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float16
+
+
+AMP_DTYPE = _select_amp_dtype()
+USE_GRAD_SCALER = AMP_DTYPE == torch.float16
+INPUT_MEM_FMT = torch.channels_last if torch.cuda.is_available() else torch.contiguous_format
+
 def setup_ddp():
     if not dist.is_initialized():
         dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
@@ -173,7 +184,7 @@ def _extract_single_embeddings(model, persons, img_size, device, batch_size=64,
 
     all_embs, all_pids, local_indices = [], [], []
     for bx, bpid in ld:
-        bx = bx.to(device, non_blocking=True)
+        bx = bx.to(device, non_blocking=True, memory_format=INPUT_MEM_FMT)
         if local_module is None:
             emb = model(bx)
         else:
@@ -222,8 +233,8 @@ def evaluate(model:nn.Module, val_ld, device, split="val", local_criterion=None,
     extreme_topk_tensor = torch.zeros(len(extreme_topk), dtype=torch.float32, device=device)
 
     for bx1, bx2, by in val_ld:
-        bx1 = bx1.to(device, non_blocking=True)
-        bx2 = bx2.to(device, non_blocking=True)
+        bx1 = bx1.to(device, non_blocking=True, memory_format=INPUT_MEM_FMT)
+        bx2 = bx2.to(device, non_blocking=True, memory_format=INPUT_MEM_FMT)
         by = by.to(device, non_blocking=True)
         bx = torch.concat([bx1, bx2], dim=0)
         if local_module is None:
@@ -380,62 +391,57 @@ def train(model:nn.Module, train_ld, val_ld, device, criterion, local_criterion,
     for p in model.parameters():
         dist.broadcast(p.data, src=0) if dist.is_initialized() else None
 
-    scaler = GradScaler("cuda")
+    scaler = GradScaler("cuda", enabled=USE_GRAD_SCALER)
+    # 收集 clip 用的参数列表只构建一次，避免每个 step 重建 list
+    clip_params = list(model.parameters()) + list(criterion.parameters()) + list(local_criterion.parameters())
     for epoch in range(start_epoch, epochs + 1):
         model.train()
         if isinstance(train_ld.sampler, DistributedSampler):
             train_ld.sampler.set_epoch(epoch)
         if hasattr(train_ld.dataset, 'set_epoch'):
             train_ld.dataset.set_epoch(epoch)
-        
-        loss_avg = 0
-        supcon_avg = 0
-        top1_avg, top10_avg, top100_avg = 0, 0, 0
+
+        # device tensor 累加 [loss, top1, top10, top100, supcon]，避免 .item() 触发 H2D/D2H 同步
+        metric_sum = torch.zeros(5, device=device)
 
         for bx, by in tqdm(train_ld, disable=not is_main_process()):
-            bx = bx.to(device, non_blocking=True)
+            bx = bx.to(device, non_blocking=True, memory_format=INPUT_MEM_FMT)
             by = by.to(device, non_blocking=True)
-            with autocast("cuda"):
+            with autocast("cuda", dtype=AMP_DTYPE):
                 global_emb, local_feat = model(bx, return_local=True)
                 loss_global, logits = criterion(global_emb, by)
                 loss_local = local_criterion(local_feat, by)
                 loss = loss_global + 0.6 * loss_local
-                
+
                 if supcon_criterion is not None:
                     loss_supcon = supcon_criterion(global_emb, by)
                     loss = loss + supcon_weight * loss_supcon
-                    supcon_avg += loss_supcon.item()
-            
+                    metric_sum[4] += loss_supcon.detach().float()
+
             with torch.no_grad():
                 acc1, acc10, acc100 = accuracy(logits, by, topk=(1, 10, 100))
-                top1_avg += acc1.item()
-                top10_avg += acc10.item()
-                top100_avg += acc100.item()
-                
-            optimizer.zero_grad()
+                metric_sum[0] += loss.detach().float()
+                metric_sum[1] += acc1.squeeze().detach().float()
+                metric_sum[2] += acc10.squeeze().detach().float()
+                metric_sum[3] += acc100.squeeze().detach().float()
+
+            optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
-            
-            # 在进行梯度裁剪前必须先 unscale，否则裁剪的是放大后的梯度
+
+            # 在进行梯度裁剪前必须先 unscale，否则裁剪的是放大后的梯度（bf16 时为 no-op）
             scaler.unscale_(optimizer)
-            
+
             # 在训练前期极易发生梯度爆炸导致网络摆烂，加上梯度裁剪
-            all_params = list(model.parameters()) + list(criterion.parameters()) + list(local_criterion.parameters())
-            torch.nn.utils.clip_grad_norm_(all_params, max_norm=5.0)
-            
+            torch.nn.utils.clip_grad_norm_(clip_params, max_norm=5.0)
+
             scaler.step(optimizer)
             scaler.update()
-            loss_avg += loss.item()
 
-        loss_tensor = torch.tensor([loss_avg, top1_avg, top10_avg, top100_avg, supcon_avg], device=device)
         if dist.is_initialized():
-            dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
-            loss_tensor /= world_size
-        
-        loss_avg = loss_tensor[0].item() / len(train_ld)
-        top1_avg = loss_tensor[1].item() / len(train_ld)
-        top10_avg = loss_tensor[2].item() / len(train_ld)
-        top100_avg = loss_tensor[3].item() / len(train_ld)
-        supcon_avg = loss_tensor[4].item() / len(train_ld)
+            dist.all_reduce(metric_sum, op=dist.ReduceOp.SUM)
+            metric_sum /= world_size
+
+        loss_avg, top1_avg, top10_avg, top100_avg, supcon_avg = (metric_sum / len(train_ld)).tolist()
 
         train_acc, _, _ = evaluate(model, train_eval_ld, device, split="train", local_criterion=local_criterion)
         acc, margin, val_topk = evaluate(
@@ -515,6 +521,10 @@ if __name__ == "__main__":
     local_rank = setup_ddp()
     if dist.is_initialized(): world_size = dist.get_world_size()
     torch.backends.cudnn.benchmark = True
+    # 开启 TF32 让 Ampere+ 的 fp32 matmul/conv 走 TensorCore，单步更快、对精度几乎无影响
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
 
     if is_main_process(): writer = SummaryWriter(log_dir=log_path)
 
@@ -523,18 +533,24 @@ if __name__ == "__main__":
         world_size=world_size, rank=local_rank, batch_size=320,
         num_worker=16, prefetch_factor=2
     )
-    
+
     model = FaceSequential(CowResNet(), ViT(count=112, emb_dim=512)).to(device)
+    if torch.cuda.is_available():
+        # CNN backbone 在 NHWC + AMP 下吞吐显著高于 NCHW
+        model = model.to(memory_format=torch.channels_last)
     model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-    model = DDP(model, device_ids=[local_rank] if torch.cuda.is_available() else None)
+    ddp_kwargs = dict(find_unused_parameters=False, gradient_as_bucket_view=True)
+    if torch.cuda.is_available():
+        ddp_kwargs["device_ids"] = [local_rank]
+    model = DDP(model, **ddp_kwargs)
 
     criterion = ArcFaceLoss(512, data_process.num_train, label_smoothing=LABEL_SMOOTHING).to(device)
-    criterion = DDP(criterion, device_ids=[local_rank] if torch.cuda.is_available() else None)
-    
+    criterion = DDP(criterion, **ddp_kwargs)
+
     local_criterion = LocalSplitArcFaceLoss(
         512, data_process.num_train, splits=2, label_smoothing=LABEL_SMOOTHING
     ).to(device)
-    local_criterion = DDP(local_criterion, device_ids=[local_rank] if torch.cuda.is_available() else None)
+    local_criterion = DDP(local_criterion, **ddp_kwargs)
 
     supcon_criterion = SupConLoss(temperature=0.07).to(device)
 

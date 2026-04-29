@@ -175,20 +175,22 @@ def move_labels_to_device(labels, device):
     return moved
 
 
-def train_one_epoch(model, dataloader, optimizer, device, scaler=None):
+def train_one_epoch(model, dataloader, optimizer, device, scaler=None, amp_dtype=torch.float16, use_channels_last=False):
     model.train()
     total_loss = 0.0
 
     progress = tqdm(dataloader, desc="train", leave=False)
     for step, batch in enumerate(progress, start=1):
-        pixel_values = batch["pixel_values"].to(device)
-        pixel_mask = batch["pixel_mask"].to(device)
+        pixel_values = batch["pixel_values"].to(device, non_blocking=True)
+        if use_channels_last:
+            pixel_values = pixel_values.contiguous(memory_format=torch.channels_last)
+        pixel_mask = batch["pixel_mask"].to(device, non_blocking=True)
         labels = move_labels_to_device(batch["labels"], device)
 
         optimizer.zero_grad(set_to_none=True)
 
         if scaler is not None:
-            with torch.amp.autocast("cuda"):
+            with torch.amp.autocast("cuda", dtype=amp_dtype):
                 outputs = model(pixel_values=pixel_values, pixel_mask=pixel_mask, labels=labels)
                 loss = outputs.loss
             scaler.scale(loss).backward()
@@ -200,8 +202,9 @@ def train_one_epoch(model, dataloader, optimizer, device, scaler=None):
             loss.backward()
             optimizer.step()
 
-        total_loss += loss.detach().item()
-        progress.set_postfix(loss=f"{loss.detach().item():.4f}", step=f"{step}/{len(dataloader)}")
+        loss_val = loss.detach().item()
+        total_loss += loss_val
+        progress.set_postfix(loss=f"{loss_val:.4f}", step=f"{step}/{len(dataloader)}")
 
     return total_loss / len(dataloader)
 
@@ -231,10 +234,10 @@ def maybe_freeze_backbone(model):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="使用 ObjDetARec 数据微调 DETR")
+    parser = argparse.ArgumentParser(description="微调 DETR")
     parser.add_argument("--model-path", type=str, default="./detr-resnet-50")
-    parser.add_argument("--image-dir", type=str, default="./ObjDetARec/yolo/images")
-    parser.add_argument("--label-dir", type=str, default="./ObjDetARec/yolo/labels")
+    parser.add_argument("--image-dir", type=str, default="./data/yolo/images")
+    parser.add_argument("--label-dir", type=str, default="./data/yolo/labels")
     parser.add_argument("--output-dir", type=str, default="./detr-cow-finetuned")
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=4)
@@ -251,6 +254,15 @@ def main():
     args = parse_args()
     set_seed(args.seed)
     device = get_device()
+    use_cuda = device.type == "cuda"
+    if use_cuda:
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
+        amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    else:
+        amp_dtype = torch.float16
 
     model_path = Path(args.model_path)
     output_dir = Path(args.output_dir)
@@ -273,6 +285,8 @@ def main():
         maybe_freeze_backbone(model)
 
     model.to(device)
+    if use_cuda:
+        model = model.to(memory_format=torch.channels_last)
 
     train_dataset, val_dataset = build_datasets(
         image_dir=Path(args.image_dir),
@@ -302,7 +316,9 @@ def main():
     )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scaler = torch.amp.GradScaler("cuda") if torch.cuda.is_available() else None
+    # bf16 不需要 GradScaler，但仍然走 autocast；用 enabled 控制 fp16 时才生效
+    use_grad_scaler = use_cuda and amp_dtype == torch.float16
+    scaler = torch.amp.GradScaler("cuda", enabled=use_grad_scaler) if use_cuda else None
     best_val_loss = float("inf")
 
     print(f"device: {device}")
@@ -312,7 +328,8 @@ def main():
 
     for epoch in range(1, args.epochs + 1):
         print(f"\n===== epoch {epoch}/{args.epochs} =====")
-        train_loss = train_one_epoch(model, train_loader, optimizer, device, scaler=scaler)
+        train_loss = train_one_epoch(model, train_loader, optimizer, device, scaler=scaler,
+                                     amp_dtype=amp_dtype, use_channels_last=use_cuda)
         val_loss = evaluate(model, val_loader, device)
 
         print(f"epoch {epoch}/{args.epochs} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f}")

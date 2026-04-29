@@ -17,15 +17,12 @@ processor = AutoImageProcessor.from_pretrained(model_path, use_fast=False)
 model = AutoModelForObjectDetection.from_pretrained(model_path).to(device)
 model.eval()
 
-# 读取图片
 image = Image.open("cow.jpg").convert("RGB")
-
-# 预处理
 inputs = processor(images=image, return_tensors="pt")
 inputs = {k: v.to(device) for k, v in inputs.items()}
 
-# 推理
-with torch.no_grad():
+amp_dtype = torch.bfloat16 if device == "cuda" and torch.cuda.is_bf16_supported() else torch.float16
+with torch.inference_mode(), torch.autocast("cuda", dtype=amp_dtype, enabled=device == "cuda"):
     outputs = model(**inputs)
 
 # 后处理

@@ -1,9 +1,15 @@
 FaceNetPack/Dataset/*
-ObjDetARec/*
+data/
 
-# Python
+FaceNetPack/Model/State/
+detr-resnet-50/
+*.pth
+# detr-cow-finetuned/ 通过 Git LFS 跟踪 (.gitattributes 已配置 *.safetensors)
+
 __pycache__/
-
-# macOS
+.venv/
+venv/
+env/
 .DS_Store
 ._*
+.vscode/
