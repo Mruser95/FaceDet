@@ -1,3 +1,9 @@
+import sys
+from pathlib import Path
+
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from FaceNetPack.Model.Backbone import CowResNet
 from FaceNetPack.Model.ArcFace import ArcFaceLoss, LocalSplitArcFaceLoss, SupConLoss, build_optim
 from FaceNetPack.Model.VisionTransformer import ViT
@@ -9,7 +15,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 import os
-from pathlib import Path
+import shutil
 from tqdm import tqdm
 from torch.amp import autocast, GradScaler
 from torch.utils.tensorboard import SummaryWriter
@@ -26,6 +32,9 @@ writer = None
 LABEL_SMOOTHING = 0.0
 VAL_EXTREME_TOPK = (1, 5, 10)
 VAL_EXTREME_SAMPLE_SEED = 0
+MISS_EXAMPLE_COUNT = 1
+MISS_EXPORT_EPOCH = 9
+MISS_EXPORT_ROOT = Path(__file__).resolve().parent / "State" / f"miss_epoch_{MISS_EXPORT_EPOCH}"
 
 
 def _select_amp_dtype():
@@ -162,6 +171,31 @@ def retrieval_topk_accuracy(embeddings, pids, topk=VAL_EXTREME_TOPK,
     return scores, errors
 
 
+def _export_miss_images(errors, epoch, export_epoch=MISS_EXPORT_EPOCH,
+                        export_root=MISS_EXPORT_ROOT):
+    if epoch != export_epoch:
+        return
+
+    if export_root.exists():
+        shutil.rmtree(export_root)
+    export_root.mkdir(parents=True, exist_ok=True)
+
+    for idx, error in enumerate(errors, start=1):
+        pair_dir = export_root / (
+            f"pair_{idx:04d}_qpid_{error['query_pid']}_"
+            f"mpid_{error['matched_pid']}_sim_{error['similarity']:.4f}"
+        )
+        pair_dir.mkdir(parents=True, exist_ok=True)
+        query_path = Path(error["query"])
+        matched_path = Path(error["matched"])
+        if query_path.exists():
+            shutil.copy2(query_path, pair_dir / f"query{query_path.suffix}")
+        if matched_path.exists():
+            shutil.copy2(matched_path, pair_dir / f"matched{matched_path.suffix}")
+
+    print(f"[val] epoch {epoch} miss images saved to: {export_root}")
+
+
 def _extract_single_embeddings(model, persons, img_size, device, batch_size=64,
                                local_criterion=None, local_weight=0.3):
     """用 SingleImageDataset 提取验证集每张图的 embedding、person_id 和路径。
@@ -218,7 +252,7 @@ def _extract_single_embeddings(model, persons, img_size, device, batch_size=64,
 @torch.no_grad()
 def evaluate(model:nn.Module, val_ld, device, split="val", local_criterion=None,
              local_weight=0.3, calc_extreme_topk=False,
-             extreme_topk=VAL_EXTREME_TOPK):
+             extreme_topk=VAL_EXTREME_TOPK, epoch=None):
     model.eval()
     local_module = None
     local_training = False
@@ -306,16 +340,13 @@ def evaluate(model:nn.Module, val_ld, device, split="val", local_criterion=None,
             print("no negative pairs")
         print(f"[{split}] margin: {margin_value}")
         if calc_extreme_topk:
-            topk_msg = ", ".join(
-                f"top{k}: {score * 100:.2f}%"
-                for k, score in zip(extreme_topk, extreme_topk_tensor.tolist())
-            )
-            print(f"[{split}] retrieval {topk_msg}")
             if errors:
                 print(f"[{split}] retrieval misses: {len(errors)}")
-                for e in errors[:10]:
+                for e in errors[:MISS_EXAMPLE_COUNT]:
                     print(f"  MISS sim={e['similarity']:.4f} | query(pid={e['query_pid']}): {e['query']}")
-                    print(f"       top1(pid={e['matched_pid']}): {e['matched']}")
+                    print(f"       top1(pid={e['matched_pid']}): {e['matched']}\n")
+            if split == "val" and epoch is not None:
+                _export_miss_images(errors, epoch)
     if dist.is_initialized():
         dist.broadcast(acc, src=0)
         dist.broadcast(margin, src=0)
@@ -350,7 +381,13 @@ def accuracy(output, target, topk=(1,)):
             res.append(correct_k.mul_(100.0 / batch_size))
         return res
 
-def train(model:nn.Module, train_ld, val_ld, device, criterion, local_criterion, supcon_criterion=None, supcon_weight=0.5, lr=2e-3, epochs=30, weight_decay=1e-4, resum=False):
+
+def _local_supcon_loss(supcon_criterion, local_embs, labels):
+    losses = [supcon_criterion(local_emb, labels) for local_emb in local_embs]
+    return torch.stack(losses, dim=0).mean()
+
+
+def train(model:nn.Module, train_ld, val_ld, device, criterion, local_criterion, supcon_criterion=None, supcon_weight=0.6, local_supcon_weight=0.4, lr=2e-3, epochs=30, weight_decay=1e-4, resum=False):
     criterion_module = criterion.module if isinstance(criterion, DDP) else criterion
     local_criterion_module = local_criterion.module if isinstance(local_criterion, DDP) else local_criterion
     optim_modules = [model, criterion_module, local_criterion_module]
@@ -360,13 +397,13 @@ def train(model:nn.Module, train_ld, val_ld, device, criterion, local_criterion,
     optimizer = build_optim(nn.ModuleList(optim_modules), lr, weight_decay)
     train_eval_ld = build_pair_eval_loader(train_ld, val_ld)
     
-    warmup_epochs = 4
+    warmup_epochs = 3
     warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.3, total_iters=warmup_epochs)
     plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode="max",
         factor=0.5,
-        patience=3,
+        patience=2,
         threshold=0.001,
         min_lr=5e-6,
     )
@@ -401,8 +438,8 @@ def train(model:nn.Module, train_ld, val_ld, device, criterion, local_criterion,
         if hasattr(train_ld.dataset, 'set_epoch'):
             train_ld.dataset.set_epoch(epoch)
 
-        # device tensor 累加 [loss, top1, top10, top100, supcon]，避免 .item() 触发 H2D/D2H 同步
-        metric_sum = torch.zeros(5, device=device)
+        # device tensor 累加 [loss, top1, top10, top100, supcon, local_supcon]，避免 .item() 触发 H2D/D2H 同步
+        metric_sum = torch.zeros(6, device=device)
 
         for bx, by in tqdm(train_ld, disable=not is_main_process()):
             bx = bx.to(device, non_blocking=True, memory_format=INPUT_MEM_FMT)
@@ -410,13 +447,15 @@ def train(model:nn.Module, train_ld, val_ld, device, criterion, local_criterion,
             with autocast("cuda", dtype=AMP_DTYPE):
                 global_emb, local_feat = model(bx, return_local=True)
                 loss_global, logits = criterion(global_emb, by)
-                loss_local = local_criterion(local_feat, by)
-                loss = loss_global + 0.6 * loss_local
+                loss_local, local_embs = local_criterion(local_feat, by, return_embs=True)
+                loss = loss_global + 0.8 * loss_local
 
                 if supcon_criterion is not None:
                     loss_supcon = supcon_criterion(global_emb, by)
-                    loss = loss + supcon_weight * loss_supcon
+                    loss_local_supcon = _local_supcon_loss(supcon_criterion, local_embs, by)
+                    loss = loss + supcon_weight * loss_supcon + local_supcon_weight * loss_local_supcon
                     metric_sum[4] += loss_supcon.detach().float()
+                    metric_sum[5] += loss_local_supcon.detach().float()
 
             with torch.no_grad():
                 acc1, acc10, acc100 = accuracy(logits, by, topk=(1, 10, 100))
@@ -441,7 +480,7 @@ def train(model:nn.Module, train_ld, val_ld, device, criterion, local_criterion,
             dist.all_reduce(metric_sum, op=dist.ReduceOp.SUM)
             metric_sum /= world_size
 
-        loss_avg, top1_avg, top10_avg, top100_avg, supcon_avg = (metric_sum / len(train_ld)).tolist()
+        loss_avg, top1_avg, top10_avg, top100_avg, supcon_avg, local_supcon_avg = (metric_sum / len(train_ld)).tolist()
 
         train_acc, _, _ = evaluate(model, train_eval_ld, device, split="train", local_criterion=local_criterion)
         acc, margin, val_topk = evaluate(
@@ -451,6 +490,7 @@ def train(model:nn.Module, train_ld, val_ld, device, criterion, local_criterion,
             split="val",
             local_criterion=local_criterion,
             calc_extreme_topk=True,
+            epoch=epoch,
         )
         if epoch <= warmup_epochs:
             warmup_scheduler.step()
@@ -473,6 +513,7 @@ def train(model:nn.Module, train_ld, val_ld, device, criterion, local_criterion,
             writer.add_scalar("loss/epoch", loss_avg, epoch)
             if supcon_criterion is not None:
                 writer.add_scalar("supcon_loss/epoch", supcon_avg, epoch)
+                writer.add_scalar("local_supcon_loss/epoch", local_supcon_avg, epoch)
             writer.add_scalar("train_acc/epoch", train_acc, epoch)
             writer.add_scalar("train_top1/epoch", top1_avg, epoch)
             writer.add_scalar("train_top10/epoch", top10_avg, epoch)
@@ -486,12 +527,12 @@ def train(model:nn.Module, train_ld, val_ld, device, criterion, local_criterion,
                 f"val_top{k}: {score * 100:.2f}%"
                 for k, score in zip(VAL_EXTREME_TOPK, val_topk)
             )
-            supcon_msg = f", supcon: {supcon_avg:.4f}" if supcon_criterion is not None else ""
+            supcon_msg = f", supcon: {supcon_avg:.4f}, local_supcon: {local_supcon_avg:.4f}" if supcon_criterion is not None else ""
             print(f"  ========== epoch: {epoch} ==========\nloss: {loss_avg:.4f}{supcon_msg}, train_acc: {train_acc:.4f}, val_acc: {acc:.4f}\n"
                   f"train_top1: {top1_avg:.2f}%, train_top10: {top10_avg:.2f}%, train_top100: {top100_avg:.2f}%\n"
-                  f"{val_topk_msg}\n")
+                  f"{val_topk_msg}\n\n")
 
-        if is_main_process() and epoch % 5 == 0:
+        if is_main_process() and epoch % 4 == 0:
             try:
                 print(f"[xgb] Training XGBoost at epoch {epoch}...")
                 X_train_xgb, y_train_xgb = collect_features_and_labels(
@@ -531,7 +572,7 @@ if __name__ == "__main__":
     data_process = Process(train_num=32000, val_num=1600, device=device)
     train_ld, val_ld = data_process.loader(
         world_size=world_size, rank=local_rank, batch_size=320,
-        num_worker=16, prefetch_factor=2
+        num_worker=18, prefetch_factor=2
     )
 
     model = FaceSequential(CowResNet(), ViT(count=112, emb_dim=512)).to(device)
@@ -555,7 +596,8 @@ if __name__ == "__main__":
     supcon_criterion = SupConLoss(temperature=0.07).to(device)
 
     train(model, train_ld, val_ld, device, criterion, local_criterion,
-          supcon_criterion=supcon_criterion, supcon_weight=0.5, resum=False)
+            supcon_criterion=supcon_criterion, supcon_weight=0.5,
+            local_supcon_weight=0.2, resum=False)
 
     if dist.is_initialized(): dist.destroy_process_group()
 

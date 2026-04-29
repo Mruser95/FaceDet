@@ -1,7 +1,7 @@
 FaceNetPack/Dataset/*
 data/
 
-FaceNetPack/Model/State/
+FaceNetPack/State/*
 detr-resnet-50/
 *.pth
 # detr-cow-finetuned/ 通过 Git LFS 跟踪 (.gitattributes 已配置 *.safetensors)

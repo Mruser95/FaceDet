@@ -61,7 +61,7 @@ python -m FaceNetPack.clean_crop_data [--delete]
 
 ```bash
 # 训练 RGB-D 识别模型
-torchrun --nproc_per_node=1 FaceNetPack/cloud_train.py
+torchrun --nproc_per_node=1 -m FaceNetPack.cloud_train
 # 阈值分析 & ROC
 python -m FaceNetPack.Model.MarginModel
 ```

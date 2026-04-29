@@ -14,39 +14,12 @@ _sam_root = Path(__file__).resolve().parent / "Dataset" / "325_sam"
 dataroot = Path(__file__).resolve().parent / "Dataset" / "325_crop"
 _fallback_root = Path(__file__).resolve().parent / "Dataset" / "325"
 
-MIN_CROP_AREA = 6000
-MIN_CROP_DIM = 50
-MIN_CONTENT_RATIO = 0.15
-MAX_DEPTH_MEAN = 2500
-
 # 复用同一组 transform 实例可省掉每张图片的对象构造开销
 _TO_TENSOR = transforms.ToTensor()
 _NORMALIZE_4CH = transforms.Normalize(mean=[0.5] * 4, std=[0.5] * 4)
 
 
-def _is_valid_image(color_path, depth_path=None, min_area=MIN_CROP_AREA,
-                    min_dim=MIN_CROP_DIM, min_content=MIN_CONTENT_RATIO,
-                    max_depth=MAX_DEPTH_MEAN):
-    """快速检查裁切图质量：尺寸不能太小、内容不能太少、深度不能太远。"""
-    try:
-        img = Image.open(color_path)
-        w, h = img.size
-        if w * h < min_area or min(w, h) < min_dim:
-            return False
-        arr = np.array(img)
-        if (arr > 5).mean() < min_content:
-            return False
-        if depth_path is not None and max_depth > 0:
-            d_arr = np.array(Image.open(depth_path), dtype=np.float32)
-            d_valid = d_arr[d_arr > 0]
-            if d_valid.size > 0 and d_valid.mean() > max_depth:
-                return False
-        return True
-    except Exception:
-        return False
-
-
-def read_dataset(root=None, filter_quality=True):
+def read_dataset(root=None):
     if root is None:
         for _candidate in [dataroot, _sam_root, _fallback_root]:
             if _candidate.exists():
@@ -55,7 +28,6 @@ def read_dataset(root=None, filter_quality=True):
         else:
             root = _fallback_root
 
-    is_crop_dir = ("crop" in root.name)
     num_re = re.compile(r"(\d+)$")
 
     def extract_id(stem: str):
@@ -63,7 +35,6 @@ def read_dataset(root=None, filter_quality=True):
         return int(m.group(1)) if m else None
 
     persons = []
-    total_imgs, filtered_imgs = 0, 0
     for sub in sorted(root.glob('*')):
         colroot, deproot = sub / "color", sub / "depth"
         if not (colroot.exists() and deproot.exists()):
@@ -75,17 +46,10 @@ def read_dataset(root=None, filter_quality=True):
         imgs = sorted(set(color) & set(depth))
         person = []
         for p in imgs:
-            total_imgs += 1
-            if filter_quality and is_crop_dir and not _is_valid_image(color[p], depth[p]):
-                filtered_imgs += 1
-                continue
             person.append([color[p], depth[p]])
         if person:
             persons.append(person)
 
-    if filtered_imgs >= 0:
-        print(f"[data] 质量过滤: 共 {total_imgs} 张, 过滤 {filtered_imgs} 张, "
-              f"保留 {total_imgs - filtered_imgs} 张")
     return persons
 
 

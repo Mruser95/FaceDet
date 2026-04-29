@@ -65,7 +65,7 @@ class SupConLoss(nn.Module):
     与 ArcFace 的分类信号互补：ArcFace 让 embedding 靠近各自的类中心，
     SupCon 则直接优化样本间的相对距离结构。
     """
-    def __init__(self, temperature=0.07):
+    def __init__(self, temperature=0.1):
         super().__init__()
         self.temperature = temperature
 
@@ -96,6 +96,8 @@ class SupConLoss(nn.Module):
             mean_log_prob = (mask_pos.float() * log_prob).sum(dim=1)
             mean_log_prob = mean_log_prob / num_pos.clamp(min=1.0)
 
+            if not has_pos.any():
+                return emb.new_zeros(())
             loss = -mean_log_prob[has_pos].mean()
             return loss
 
@@ -117,7 +119,7 @@ class LocalSplitArcFaceLoss(nn.Module):
             nn.BatchNorm1d(emb_dim) for _ in range(splits)
         ])
 
-    def forward(self, local_feat: torch.Tensor, label: torch.Tensor):
+    def forward(self, local_feat: torch.Tensor, label: torch.Tensor, return_embs=False):
         """
         local_feat: [B, C, H, W] 恢复后的局部特征图
         label: [B]
@@ -126,14 +128,19 @@ class LocalSplitArcFaceLoss(nn.Module):
         chunks = torch.chunk(local_feat, self.splits, dim=2)
         
         total_loss = 0.0
+        local_embs = []
         for i, chunk in enumerate(chunks):
             # 对每个局部块进行空间全局平均池化得到特征向量: [B, C]
             chunk_emb = chunk.mean(dim=[2, 3])
             # 对局部特征进行 BN 归一化
             chunk_emb = self.bns[i](chunk_emb)
+            if return_embs:
+                local_embs.append(chunk_emb)
             
             # 分别计算ArcFace损失并累加
             loss, _ = self.loss_funcs[i](chunk_emb, label)
             total_loss += loss
-            
-        return total_loss / self.splits  # 平均损失，防止局部损失过大导致梯度爆炸
+        total_loss = total_loss / self.splits  # 平均损失，防止局部损失过大导致梯度爆炸
+        if return_embs:
+            return total_loss, torch.stack(local_embs, dim=0)
+        return total_loss
